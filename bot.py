@@ -4,6 +4,7 @@ import logging
 import random
 import asyncio
 import pickle
+import copy
 from collections import defaultdict
 from dotenv import load_dotenv
 from pymongo import MongoClient
@@ -35,14 +36,15 @@ class MongoPersistence(BasePersistence):
     A complete and corrected custom persistence class that uses MongoDB to store bot data.
     """
     def __init__(self, mongo_uri: str, database_name: str = 'telegram_bot_db'):
-        super().__init__(store_user_data=True, store_chat_data=True, store_bot_data=True)
+        # FIX: The super().__init__() call no longer takes arguments in recent versions.
+        super().__init__()
         self.client = MongoClient(mongo_uri)
         self.db = self.client[database_name]
         self.user_collection = self.db['user_data']
         self.chat_collection = self.db['chat_data']
         self.bot_collection = self.db['bot_data']
         self.conv_collection = self.db['conversations']
-        self.callback_collection = self.db['callback_data'] # Added for completeness
+        self.callback_collection = self.db['callback_data']
 
     async def get_bot_data(self) -> dict:
         record = self.bot_collection.find_one({'_id': 'bot_data'})
@@ -98,8 +100,6 @@ class MongoPersistence(BasePersistence):
         else:
             self.conv_collection.delete_one({'_id': name})
     
-    # --- Implementing the missing abstract methods ---
-
     async def drop_chat_data(self, chat_id: int) -> None:
         self.chat_collection.delete_one({'_id': chat_id})
 
@@ -117,18 +117,17 @@ class MongoPersistence(BasePersistence):
         else:
             self.callback_collection.delete_one({'_id': 'callback_data'})
 
-    # refresh_* methods are for in-memory caches, which we don't use. So they can be no-ops.
     async def refresh_bot_data(self, bot_data: dict) -> None:
-        pass  # Data is always fetched fresh from DB
+        pass
 
     async def refresh_chat_data(self, chat_id: int, chat_data: dict) -> None:
-        pass  # Data is always fetched fresh from DB
+        pass
 
     async def refresh_user_data(self, user_id: int, user_data: dict) -> None:
-        pass  # Data is always fetched fresh from DB
+        pass
 
     async def flush(self) -> None:
-        pass # Data is saved on update, so flush is not needed.
+        pass
 
 # --- State Constants for ConversationHandler ---
 ADD_CHANNEL, ADD_TOPIC, ADD_SCHEDULE_BASE, ADD_SCHEDULE_RANDOM = range(4)
@@ -170,7 +169,6 @@ async def generate_welcome_message() -> str:
     except Exception as e:
         logger.error(f"Error generating welcome message: {e}")
         return "Welcome! Let's get your channels automated."
-
 
 # --- Core Bot & Job Functions ---
 async def post_to_channel(context: ContextTypes.DEFAULT_TYPE):
@@ -260,8 +258,6 @@ async def list_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(message, parse_mode='MarkdownV2')
 
 # --- Conversation Handlers (Add, Remove, Edit, Postnow, Broadcast) ---
-# The logic for these conversations remains unchanged.
-
 async def add_channel_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Let's add a new channel. What is the channel's username? (Must be in @username format)")
     return ADD_CHANNEL
@@ -427,13 +423,11 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def post_init(application: Application) -> None:
     """Reschedule all jobs on bot startup from persisted data."""
-    # A deep copy is needed because the data might be modified during iteration
     user_data_copy = copy.deepcopy(application.user_data)
     for user_id, user_data in user_data_copy.items():
         if 'channels' in user_data:
             for channel_id, config in user_data['channels'].items():
                 logger.info(f"Rescheduling job from DB for user {user_id}, channel {channel_id}")
-                # The chat_id for run_once is the user's private chat
                 schedule_first_job_for_channel(
                     application, user_id, channel_id,
                     config['topic'], config['base_seconds'], config['random_seconds']
