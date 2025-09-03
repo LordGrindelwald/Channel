@@ -36,7 +36,6 @@ class MongoPersistence(BasePersistence):
     A complete and corrected custom persistence class that uses MongoDB to store bot data.
     """
     def __init__(self, mongo_uri: str, database_name: str = 'telegram_bot_db'):
-        # FIX: The super().__init__() call no longer takes arguments in recent versions.
         super().__init__()
         self.client = MongoClient(mongo_uri)
         self.db = self.client[database_name]
@@ -423,7 +422,8 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def post_init(application: Application) -> None:
     """Reschedule all jobs on bot startup from persisted data."""
-    user_data_copy = copy.deepcopy(application.user_data)
+    # FIX: Convert the mappingproxy to a standard dict before iterating.
+    user_data_copy = dict(application.user_data)
     for user_id, user_data in user_data_copy.items():
         if 'channels' in user_data:
             for channel_id, config in user_data['channels'].items():
