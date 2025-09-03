@@ -38,7 +38,7 @@ async def generate_ai_content(topic: str) -> str:
         return "Please set a topic first using /settopic."
 
     try:
-        model = genai.GenerativeModel('gemini-pro')
+        model = genai.GenerativeModel('gemini-1.5-flash-latest')
         prompt = (
             f"Create a short, engaging, and informative Telegram post about '{topic}'. "
             "The post should be easy to read, well-formatted, and interesting for a general audience. "
