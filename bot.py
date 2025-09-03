@@ -4,7 +4,6 @@ import logging
 import random
 import asyncio
 import pickle
-import copy
 from collections import defaultdict
 from dotenv import load_dotenv
 from pymongo import MongoClient
@@ -30,10 +29,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- MongoDB Persistence Class ---
+# --- MongoDB Persistence Class (Corrected & Complete) ---
 class MongoPersistence(BasePersistence):
-    """A custom persistence class that uses MongoDB to store bot data."""
-
+    """
+    A complete and corrected custom persistence class that uses MongoDB to store bot data.
+    """
     def __init__(self, mongo_uri: str, database_name: str = 'telegram_bot_db'):
         super().__init__(store_user_data=True, store_chat_data=True, store_bot_data=True)
         self.client = MongoClient(mongo_uri)
@@ -42,6 +42,7 @@ class MongoPersistence(BasePersistence):
         self.chat_collection = self.db['chat_data']
         self.bot_collection = self.db['bot_data']
         self.conv_collection = self.db['conversations']
+        self.callback_collection = self.db['callback_data'] # Added for completeness
 
     async def get_bot_data(self) -> dict:
         record = self.bot_collection.find_one({'_id': 'bot_data'})
@@ -52,20 +53,19 @@ class MongoPersistence(BasePersistence):
         self.bot_collection.update_one({'_id': 'bot_data'}, {'$set': {'data': pickled_data}}, upsert=True)
 
     def _get_data_from_collection(self, collection) -> defaultdict:
-        """Helper to load user or chat data."""
         data = defaultdict(dict)
         for record in collection.find():
-            user_id = record.get('_id')
-            user_data = record.get('data')
-            if user_id and user_data:
-                data[user_id] = pickle.loads(user_data)
+            key = record.get('_id')
+            value = record.get('data')
+            if key and value:
+                data[key] = pickle.loads(value)
         return data
 
     async def get_user_data(self) -> defaultdict:
         return self._get_data_from_collection(self.user_collection)
 
     async def update_user_data(self, user_id: int, data: dict) -> None:
-        if not data: # Don't store empty dicts
+        if not data:
             self.user_collection.delete_one({'_id': user_id})
             return
         pickled_data = pickle.dumps(data)
@@ -97,11 +97,38 @@ class MongoPersistence(BasePersistence):
             self.conv_collection.update_one({'_id': name}, {'$set': {'data': pickled_data}}, upsert=True)
         else:
             self.conv_collection.delete_one({'_id': name})
+    
+    # --- Implementing the missing abstract methods ---
+
+    async def drop_chat_data(self, chat_id: int) -> None:
+        self.chat_collection.delete_one({'_id': chat_id})
+
+    async def drop_user_data(self, user_id: int) -> None:
+        self.user_collection.delete_one({'_id': user_id})
+
+    async def get_callback_data(self) -> dict | None:
+        record = self.callback_collection.find_one({'_id': 'callback_data'})
+        return pickle.loads(record['data']) if record else None
+
+    async def update_callback_data(self, data: dict) -> None:
+        if data:
+            pickled_data = pickle.dumps(data)
+            self.callback_collection.update_one({'_id': 'callback_data'}, {'$set': {'data': pickled_data}}, upsert=True)
+        else:
+            self.callback_collection.delete_one({'_id': 'callback_data'})
+
+    # refresh_* methods are for in-memory caches, which we don't use. So they can be no-ops.
+    async def refresh_bot_data(self, bot_data: dict) -> None:
+        pass  # Data is always fetched fresh from DB
+
+    async def refresh_chat_data(self, chat_id: int, chat_data: dict) -> None:
+        pass  # Data is always fetched fresh from DB
+
+    async def refresh_user_data(self, user_id: int, user_data: dict) -> None:
+        pass  # Data is always fetched fresh from DB
 
     async def flush(self) -> None:
-        # This implementation saves data on update, so flush can be a no-op.
-        pass
-
+        pass # Data is saved on update, so flush is not needed.
 
 # --- State Constants for ConversationHandler ---
 ADD_CHANNEL, ADD_TOPIC, ADD_SCHEDULE_BASE, ADD_SCHEDULE_RANDOM = range(4)
@@ -164,7 +191,6 @@ async def post_to_channel(context: ContextTypes.DEFAULT_TYPE):
             chat_id=chat_id,
             text=f"⚠️ I couldn't post to {channel_id} (Reason: {e}). The schedule for this channel has been stopped. Please check my admin permissions and re-add the channel."
         )
-        # Also remove from user_data to prevent orphaned entries
         if context.user_data.get('channels', {}).get(channel_id):
             del context.user_data['channels'][channel_id]
         return
@@ -233,7 +259,9 @@ async def list_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     await update.message.reply_text(message, parse_mode='MarkdownV2')
 
-# --- Add Channel Conversation ---
+# --- Conversation Handlers (Add, Remove, Edit, Postnow, Broadcast) ---
+# The logic for these conversations remains unchanged.
+
 async def add_channel_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Let's add a new channel. What is the channel's username? (Must be in @username format)")
     return ADD_CHANNEL
@@ -299,8 +327,6 @@ async def add_channel_receive_schedule_random(update: Update, context: ContextTy
         await update.message.reply_text("Something went wrong. Please start over with /addchannel.")
         return ConversationHandler.END
 
-# --- Remove, Edit, Postnow, Broadcast Conversations (logic remains same) ---
-# (Code for these handlers is identical to the previous version and omitted for brevity)
 async def remove_channel_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get('channels'):
         await update.message.reply_text("You don't have any channels to remove.")
@@ -400,11 +426,14 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def post_init(application: Application) -> None:
-    """Reschedule all jobs on bot startup."""
-    for user_id, user_data in application.user_data.items():
+    """Reschedule all jobs on bot startup from persisted data."""
+    # A deep copy is needed because the data might be modified during iteration
+    user_data_copy = copy.deepcopy(application.user_data)
+    for user_id, user_data in user_data_copy.items():
         if 'channels' in user_data:
             for channel_id, config in user_data['channels'].items():
-                logger.info(f"Rescheduling job for user {user_id}, channel {channel_id}")
+                logger.info(f"Rescheduling job from DB for user {user_id}, channel {channel_id}")
+                # The chat_id for run_once is the user's private chat
                 schedule_first_job_for_channel(
                     application, user_id, channel_id,
                     config['topic'], config['base_seconds'], config['random_seconds']
@@ -429,6 +458,7 @@ def main():
         .post_init(post_init)
         .build()
     )
+
     # Conversation Handlers
     add_handler = ConversationHandler(
         entry_points=[CommandHandler('addchannel', add_channel_start)],
@@ -437,24 +467,24 @@ def main():
             ADD_TOPIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_channel_receive_topic)],
             ADD_SCHEDULE_BASE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_channel_receive_schedule_base)],
             ADD_SCHEDULE_RANDOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_channel_receive_schedule_random)],
-        }, fallbacks=[CommandHandler('cancel', cancel)]
+        }, fallbacks=[CommandHandler('cancel', cancel)], persistent=True, name="add_channel_conv"
     )
     remove_handler = ConversationHandler(
         entry_points=[CommandHandler('removechannel', remove_channel_start)],
         states={REMOVE_CHANNEL: [CallbackQueryHandler(remove_channel_callback)]},
-        fallbacks=[CommandHandler('cancel', cancel)]
+        fallbacks=[CommandHandler('cancel', cancel)], persistent=True, name="remove_channel_conv"
     )
     edit_handler = ConversationHandler(
         entry_points=[CommandHandler('edittopic', edittopic_start)],
         states={
             EDIT_CHANNEL_CHOICE: [CallbackQueryHandler(edittopic_choose_channel_callback)],
             EDIT_TOPIC_RECEIVE: [MessageHandler(filters.TEXT & ~filters.COMMAND, edittopic_receive_topic)],
-        }, fallbacks=[CommandHandler('cancel', cancel)]
+        }, fallbacks=[CommandHandler('cancel', cancel)], persistent=True, name="edit_topic_conv"
     )
     postnow_handler = ConversationHandler(
         entry_points=[CommandHandler('postnow', postnow_start)],
         states={POSTNOW_CHANNEL_CHOICE: [CallbackQueryHandler(postnow_callback)]},
-        fallbacks=[CommandHandler('cancel', cancel)]
+        fallbacks=[CommandHandler('cancel', cancel)], persistent=True, name="post_now_conv"
     )
 
     # Register handlers
