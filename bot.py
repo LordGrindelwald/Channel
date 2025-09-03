@@ -1,12 +1,10 @@
 # bot.py
 import os
 import logging
-import asyncio
 from dotenv import load_dotenv
 from telegram import Bot
-from telegram.ext import Application, CommandHandler, ConversationHandler, MessageHandler, filters
+from telegram.ext import Application, CommandHandler, ConversationHandler, MessageHandler, filters, ContextTypes
 from telegram.error import TelegramError
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import google.generativeai as genai
 
 # --- Setup and Configuration ---
@@ -22,7 +20,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- State Constants for ConversationHandler ---
-# These states help manage the flow of conversation with the user
 SET_TOPIC, SET_SCHEDULE, SET_CHANNEL = range(3)
 
 # --- AI Content Generation ---
@@ -35,27 +32,19 @@ else:
     genai.configure(api_key=gemini_api_key)
 
 async def generate_ai_content(topic: str) -> str:
-    """
-    Generates a short, engaging Telegram post on a given topic using the Gemini AI.
-
-    Args:
-        topic: The subject for the AI-generated post.
-
-    Returns:
-        The generated content as a string, ready to be posted.
-    """
+    """Generates a short, engaging Telegram post on a given topic using the Gemini AI."""
     if not topic:
         logger.warning("AI content generation called with an empty topic.")
         return "Please set a topic first using /settopic."
 
     try:
         model = genai.GenerativeModel('gemini-pro')
-        # Crafting a prompt that guides the AI to produce suitable content for a Telegram channel
         prompt = (
             f"Create a short, engaging, and informative Telegram post about '{topic}'. "
             "The post should be easy to read, well-formatted, and interesting for a general audience. "
             "Include relevant emojis to make it visually appealing. Do not include any hashtags."
         )
+        # Using the async method for generation
         response = await model.generate_content_async(prompt)
         return response.text
     except Exception as e:
@@ -64,17 +53,17 @@ async def generate_ai_content(topic: str) -> str:
 
 # --- Core Bot Functions ---
 
-async def post_to_channel(bot: Bot, channel_id: str, topic: str):
+async def post_to_channel(context: ContextTypes.DEFAULT_TYPE):
     """
-    Generates content and posts it to the specified Telegram channel.
+    Job callback function. Generates content and posts it to the channel.
+    This function is called by the JobQueue.
+    """
+    job = context.job
+    channel_id = job.data['channel_id']
+    topic = job.data['topic']
 
-    Args:
-        bot: The Telegram bot instance.
-        channel_id: The ID of the target channel.
-        topic: The topic for the content to be generated.
-    """
     if not channel_id or not topic:
-        logger.error("Channel ID or topic not set for scheduled post.")
+        logger.error("Channel ID or topic not found in job data for scheduled post.")
         return
 
     logger.info(f"Generating content for topic: {topic}")
@@ -82,7 +71,7 @@ async def post_to_channel(bot: Bot, channel_id: str, topic: str):
 
     try:
         logger.info(f"Posting to channel: {channel_id}")
-        await bot.send_message(chat_id=channel_id, text=content)
+        await context.bot.send_message(chat_id=channel_id, text=content)
         logger.info("Post successfully sent to the channel.")
     except TelegramError as e:
         logger.error(f"Failed to send message to channel {channel_id}: {e}")
@@ -100,7 +89,7 @@ async def start(update, context):
         "2. Use /setchannel to link me to your channel.\n"
         "3. Use /settopic to give me a topic to post about.\n"
         "4. Use /setschedule to choose how often I should post.\n\n"
-        "You can use /help to see all available commands."
+        "You can use /stop to halt the posting schedule."
     )
 
 async def set_channel(update, context):
@@ -113,6 +102,8 @@ async def receive_channel(update, context):
     channel = update.message.text
     context.user_data['channel_id'] = channel
     await update.message.reply_text(f"Great! I will now post to {channel}.")
+    # Attempt to start schedule if other info is present
+    await schedule_posts(update, context)
     return ConversationHandler.END
 
 async def set_topic(update, context):
@@ -125,9 +116,8 @@ async def receive_topic(update, context):
     topic = update.message.text
     context.user_data['topic'] = topic
     await update.message.reply_text(f"Topic set to: '{topic}'.")
-    # Automatically start posting if schedule and channel are already set
-    if 'schedule_interval' in context.user_data and 'channel_id' in context.user_data:
-        await schedule_posts(update, context)
+    # Attempt to start schedule if other info is present
+    await schedule_posts(update, context)
     return ConversationHandler.END
 
 async def set_schedule(update, context):
@@ -138,66 +128,74 @@ async def set_schedule(update, context):
 async def receive_schedule(update, context):
     """Receives and stores the schedule interval."""
     try:
-        interval = int(update.message.text)
-        if interval <= 0:
+        interval_hours = int(update.message.text)
+        if interval_hours <= 0:
             await update.message.reply_text("Please enter a positive number of hours.")
             return SET_SCHEDULE
-        context.user_data['schedule_interval'] = interval
-        await update.message.reply_text(f"I will post every {interval} hours.")
-        # Automatically start posting if topic and channel are already set
-        if 'topic' in context.user_data and 'channel_id' in context.user_data:
-            await schedule_posts(update, context)
+        
+        # Convert hours to seconds for the job queue
+        context.user_data['schedule_interval_seconds'] = interval_hours * 3600
+        await update.message.reply_text(f"I will post every {interval_hours} hours.")
+        # Attempt to start schedule if other info is present
+        await schedule_posts(update, context)
         return ConversationHandler.END
     except ValueError:
         await update.message.reply_text("That doesn't look like a valid number. Please enter a number of hours.")
         return SET_SCHEDULE
 
-async def schedule_posts(update, context):
-    """Schedules the recurring post job."""
-    scheduler = context.application.job_queue._scheduler
-    job_name = f"post_job_{update.effective_chat.id}"
+async def schedule_posts(update, context: ContextTypes.DEFAULT_TYPE):
+    """Schedules the recurring post job if all necessary info is present."""
+    chat_id = update.effective_message.chat_id
+    job_name = f"post_job_{chat_id}"
 
     # Remove any existing job with the same name before starting a new one
-    existing_jobs = [job for job in scheduler.get_jobs() if job.name == job_name]
-    if existing_jobs:
-        for job in existing_jobs:
-            job.remove()
+    current_jobs = context.job_queue.get_jobs_by_name(job_name)
+    if current_jobs:
+        for job in current_jobs:
+            job.schedule_removal()
         logger.info(f"Removed existing job: {job_name}")
 
+    # Check if all required user data is present
     channel_id = context.user_data.get('channel_id')
     topic = context.user_data.get('topic')
-    interval = context.user_data.get('schedule_interval')
+    interval = context.user_data.get('schedule_interval_seconds')
 
     if not all([channel_id, topic, interval]):
-        await update.message.reply_text("I can't start posting yet. Please make sure you have set the channel, topic, and schedule.")
+        # Don't send a message here, as this function is called after each setup step.
+        # It will silently wait for all data.
         return
 
-    scheduler.add_job(
-        post_to_channel,
-        'interval',
-        hours=interval,
-        args=[context.bot, channel_id, topic],
-        name=job_name
-    )
-    await update.message.reply_text("I have started the posting schedule for your channel!")
-    logger.info(f"Scheduled posts for channel {channel_id} with topic '{topic}' every {interval} hours.")
+    # Pass user data to the job
+    job_data = {'channel_id': channel_id, 'topic': topic}
 
-async def stop(update, context):
-    """Stops the scheduled posting."""
-    scheduler = context.application.job_queue._scheduler
-    job_name = f"post_job_{update.effective_chat.id}"
+    # Add the new job to the queue
+    context.job_queue.run_repeating(
+        post_to_channel,
+        interval=interval,
+        first=10,  # Start after 10 seconds
+        name=job_name,
+        data=job_data
+    )
     
-    jobs_removed = False
-    for job in scheduler.get_jobs():
-        if job.name == job_name:
-            job.remove()
-            jobs_removed = True
-            
-    if jobs_removed:
-        await update.message.reply_text("I have stopped the posting schedule.")
-        logger.info(f"Stopped posting schedule for job: {job_name}")
-    else:
+    await update.effective_message.reply_text("I have everything I need! The posting schedule has now started.")
+    logger.info(f"Scheduled posts for channel {channel_id} with topic '{topic}' every {interval} seconds.")
+
+async def stop(update, context: ContextTypes.DEFAULT_TYPE):
+    """Stops the scheduled posting."""
+    chat_id = update.effective_message.chat_id
+    job_name = f"post_job_{chat_id}"
+    
+    current_jobs = context.job_queue.get_jobs_by_name(job_name)
+    if not current_jobs:
         await update.message.reply_text("There was no active schedule to stop.")
+        return
+        
+    for job in current_jobs:
+        job.schedule_removal()
+        
+    await update.message.reply_text("I have stopped the posting schedule.")
+    logger.info(f"Stopped posting schedule for job: {job_name}")
+
 
 async def cancel(update, context):
     """Cancels the current conversation."""
@@ -237,13 +235,6 @@ def main():
     application.add_handler(conv_handler_topic)
     application.add_handler(conv_handler_schedule)
     application.add_handler(conv_handler_channel)
-
-    # Start the scheduler
-    scheduler = AsyncIOScheduler()
-    scheduler.start()
-    
-    # Keep the scheduler in the application context to access it in handlers
-    application.job_queue._scheduler = scheduler
 
     # Start the bot
     application.run_polling()
